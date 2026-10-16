@@ -17,7 +17,7 @@
 #include "sdk/plugin2.h"
 #include "sdk/logger2.h"
 
-#define VERSION_TEXT L"v1.0.2"
+#define VERSION_TEXT L"v1.0.3"
 
 static EDIT_HANDLE* g_edit = nullptr;
 static LOG_HANDLE* g_log = nullptr;
@@ -38,6 +38,7 @@ static void toggle_pin(int scene, int layer) {
 	if (s.empty()) g_pins.erase(scene);
 	pins_changed();
 }
+static bool g_ready = false;       // プロジェクトのロード通知（起動時の初期化を含む）が来て、本体の API を呼べるようになったか
 static bool g_test = false;        // 環境変数 LAYER_PIN_TEST があるときだけ、外からの試験用コマンドを受ける
 static std::wstring g_dataDir;     // プラグインフォルダの親（style.conf の上書き・試験用ファイルの置き場）
 
@@ -474,6 +475,11 @@ static LRESULT CALLBACK host_dbg_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static void tick() {
+	// 起動処理中（プロジェクトのロード通知の前）に本体の API を呼ぶと落ちる
+	// （新しいスクリプトの「追加」確認が出ている間に enum_effect_name で落ちた）。
+	// モーダルなダイアログが出ている間（本体の窓が無効）も、本体の状態が途中のことがあるので触らない
+	if (!g_ready) return;
+	if (g_host && !IsWindowEnabled(g_host)) return;
 	if (!g_host) {
 		g_host = g_edit->get_host_app_window();
 		if (!g_host) return;
@@ -943,7 +949,7 @@ static BOOL WINAPI hook_TrackPopupMenu(HMENU m, UINT flags, int x, int y, int r,
 }
 
 static BOOL WINAPI hook_inner(HMENU m, UINT flags, int x, int y, int r, HWND h, const RECT* rc) {
-	if (!g_edit || !menu_has(m, L"レイヤー名を変更")) return g_origTrack(m, flags, x, y, r, h, rc);
+	if (!g_edit || !g_ready || !menu_has(m, L"レイヤー名を変更")) return g_origTrack(m, flags, x, y, r, h, rc);
 	// 右クリックで選択レイヤーがそのレイヤーに移っている
 	EDIT_INFO info{};
 	g_edit->get_edit_info(&info, sizeof(info));
@@ -1007,6 +1013,7 @@ static void project_load(PROJECT_FILE* pf) {
 		}
 	}
 	g_geoTime = 0;
+	g_ready = true;
 	dbg(L"project_load pins=%d", (int)g_pins.size());
 }
 static void project_save(PROJECT_FILE* pf) {
@@ -1033,6 +1040,7 @@ EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable(void) {
 EXTERN_C __declspec(dllexport) void InitializeLogger(LOG_HANDLE* h) { g_log = h; }
 EXTERN_C __declspec(dllexport) bool InitializePlugin(DWORD) { return true; }
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
+	g_ready = false;
 	if (g_iatSlot && *g_iatSlot == (ULONG_PTR)hook_TrackPopupMenu) {
 		DWORD old;
 		VirtualProtect(g_iatSlot, sizeof(void*), PAGE_READWRITE, &old);
