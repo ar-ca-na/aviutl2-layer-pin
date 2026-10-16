@@ -17,12 +17,14 @@
 #include "sdk/plugin2.h"
 #include "sdk/logger2.h"
 
-#define VERSION_TEXT L"v1.0.3"
+#define VERSION_TEXT L"v1.1.0"
 
 static EDIT_HANDLE* g_edit = nullptr;
 static LOG_HANDLE* g_log = nullptr;
 static HWND g_host = nullptr;
 static HWND g_ov = nullptr;
+static HWND g_snap = nullptr;   // 押す直前の画面の写しを見せる窓
+static HWND g_snapBar = nullptr;   // 同じく縦スクロールバーの上の部分
 static HINSTANCE g_inst = nullptr;
 static std::map<int, std::set<int>> g_pins;  // scene_id -> 固定レイヤー(0から)
 static void pins_changed();
@@ -165,24 +167,23 @@ struct GeoKey {
 static GeoKey g_geoKey{};
 static DWORD g_geoTime = 0;
 
-// 重ねた行の右クリックは本体に任せる：その固定レイヤーが同じ高さに来るよう一時的に縦スクロールし、
-// 本体へ右クリックを渡す。メニューが閉じたら元の縦位置へ戻す
-static const UINT WM_LP_RESTORE = WM_APP + 0x31;
-static struct Fwd {
-	bool pending = false, menu = false;
-	int layer = 0;     // 戻す表示開始レイヤー
+// 重ねた行の操作は本体に任せる（操作の最中＝Op）。
+// 押された固定行に、その固定レイヤーの本来の行が来るよう本体を一時的に縦スクロールし、
+// その行だけ重ねた窓を外して本体に見せる。それより下は押す直前の画面の写しで覆うので、見た目はずれない。
+// 本体のドラッグ中にカーソルが固定行へ入ったときも同じようにスクロールし、出たら元の位置へ戻す
+// （本体はドラッグ中も、今の表示位置とカーソルの位置から落とす先を決める）。
+static const UINT WM_LP_END = WM_APP + 0x31;
+static struct Op {
+	bool active = false;
+	bool button = false;   // 本体が左ボタンのドラッグを続けている
+	bool right = false;    // 右クリックのメニュー待ち
+	bool menu = false;     // メニューが出た
+	int S = 0;             // 元の表示開始レイヤー
+	int row = -1;          // 本体を見せている固定行（-1 なら元の位置）
+	int setTo = 0;         // そのために合わせた表示開始レイヤー
+	std::vector<int> layers;  // 固定行のレイヤー（開始時）
 	DWORD time = 0;
-} g_fwd;
-
-static void fwd_restore() {
-	if (!g_fwd.pending) return;
-	g_fwd.pending = false;
-	EDIT_INFO info{};
-	g_edit->get_edit_info(&info, sizeof(info));
-	struct P { int a, b; } prm{g_fwd.layer, info.display_frame_start};
-	g_edit->call_edit_section_param(&prm, [](void* q, EDIT_SECTION* e) { auto r = (P*)q; e->set_display_layer_frame(r->a, r->b); });
-	g_geoTime = 0;
-}
+} g_op;
 
 static void calibrate(EDIT_SECTION* edit) {
 	Geo g;
@@ -306,14 +307,25 @@ struct View {
 	bool show = false;
 	std::vector<Row> rows;  // 上から順に重ねる固定レイヤー
 	int cursor = 0;
+	int curLayer = -1;      // 選択中のレイヤー
 	int rangeStart = -1, rangeEnd = -1;
 	RECT rc{};  // 重ねる窓の位置（ホストのクライアント座標）
 	bool operator==(const View& o) const {
-		return show == o.show && rows == o.rows && cursor == o.cursor && rangeStart == o.rangeStart && rangeEnd == o.rangeEnd &&
-			EqualRect(&rc, &o.rc);
+		return show == o.show && rows == o.rows && cursor == o.cursor && curLayer == o.curLayer && rangeStart == o.rangeStart &&
+			rangeEnd == o.rangeEnd && EqualRect(&rc, &o.rc);
 	}
 };
 static View g_view;
+
+// マウスが乗っている所（本体と同じく、行・オブジェクトの色とカーソルの形を変える）
+static struct Hover {
+	int row = -1;
+	OBJECT_HANDLE obj = nullptr;
+	bool edge = false;   // オブジェクトの端（長さを変えられる）
+	bool header = false; // レイヤー名の欄（本体は行を明るくする）
+	bool operator==(const Hover& o) const { return row == o.row && obj == o.obj && edge == o.edge && header == o.header; }
+} g_hover;
+static const int EDGE_GRIP = 8;   // 本体は端の ±8px でカーソルを ↔ にする（実測）
 
 //---------------------------------------------------------------------
 //  固定レイヤーのレイヤー名の太い枠（本来の位置に見えている行）
@@ -424,7 +436,7 @@ static void read_objects(void* p, EDIT_SECTION* edit) {
 			o.name = on ? std::wstring(on) : default_name(edit, h, first);
 			o.kind = kind_of(first);
 			o.focus = h == focus;
-			o.sel = o.focus;
+			o.sel = false;   // 複数選択の一覧に入っているものだけ明るく塗る（フォーカスは点線の枠）
 			for (auto s : sel) if (s == h) o.sel = true;
 			int ns = edit->get_object_section_num(h);
 			for (int s = 1; s < ns; s++) {
@@ -456,6 +468,13 @@ static void run_test_commands() {
 		if (swscanf(line.c_str(), L"scroll %d %d", &a, &b) == 2) {
 			struct P { int a, b; } prm{a, b};
 			g_edit->call_edit_section_param(&prm, [](void* q, EDIT_SECTION* e) { auto r = (P*)q; e->set_display_layer_frame(r->a, r->b); });
+		} else if (line == L"dumpsel") {
+			g_edit->call_read_section_param(nullptr, [](void*, EDIT_SECTION* e) {
+				OBJECT_HANDLE f = e->get_focus_object();
+				if (f) { auto lf = e->get_object_layer_frame(f); dbg(L"focus L%d %d..%d", lf.layer, lf.start, lf.end); }
+				int n = e->get_selected_object_num();
+				for (int i = 0; i < n; i++) { auto lf = e->get_object_layer_frame(e->get_selected_object(i)); dbg(L"sel L%d %d..%d", lf.layer, lf.start, lf.end); }
+			});
 		} else if (swscanf(line.c_str(), L"pin %d", &a) == 1) {
 			EDIT_INFO info{}; g_edit->get_edit_info(&info, sizeof(info));
 			if (a < 0) g_pins.erase(info.scene_id); else toggle_pin(info.scene_id, a);
@@ -467,12 +486,10 @@ static void run_test_commands() {
 //---------------------------------------------------------------------
 //  毎回の更新
 //---------------------------------------------------------------------
-static WNDPROC g_hostProcDbg = nullptr;
-static LRESULT CALLBACK host_dbg_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
-	if (m == WM_RBUTTONDOWN || m == WM_RBUTTONUP || m == WM_CONTEXTMENU || m == WM_CAPTURECHANGED)
-		dbg(L"host msg %04x w=%llx x=%d y=%d cap=%p", m, (unsigned long long)w, GET_X_LPARAM(l), GET_Y_LPARAM(l), (void*)GetCapture());
-	return CallWindowProcW(g_hostProcDbg, h, m, w, l);
-}
+static WNDPROC g_hostProc = nullptr;
+static LRESULT CALLBACK host_proc(HWND h, UINT m, WPARAM w, LPARAM l);
+static void op_end();
+static void op_refresh();
 
 static void tick() {
 	// 起動処理中（プロジェクトのロード通知の前）に本体の API を呼ぶと落ちる
@@ -486,15 +503,23 @@ static void tick() {
 		SetWindowLongPtrW(g_ov, GWL_STYLE, WS_CHILD | WS_CLIPSIBLINGS);
 		SetParent(g_ov, g_host);
 		dbg(L"host=%p style=%08lx", g_host, (unsigned long)GetWindowLongPtrW(g_host, GWL_STYLE));
-		if (g_test && _wgetenv(L"LAYER_PIN_HOSTLOG")) g_hostProcDbg = (WNDPROC)SetWindowLongPtrW(g_host, GWLP_WNDPROC, (LONG_PTR)host_dbg_proc);
+		// 押す直前の画面の写し（クリックは本体へ通す）
+		g_snap = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinSnapshot", L"", WS_CHILD | WS_CLIPSIBLINGS | WS_DISABLED, 0, 0, 0, 0, g_host, nullptr, g_inst, nullptr);
+		g_snapBar = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinSnapshot", L"", WS_CHILD | WS_CLIPSIBLINGS | WS_DISABLED, 0, 0, 0, 0, g_host, nullptr, g_inst, nullptr);
+		// 本体のドラッグ中、カーソルが固定行に入ったかを見るため
+		g_hostProc = (WNDPROC)SetWindowLongPtrW(g_host, GWLP_WNDPROC, (LONG_PTR)host_proc);
 	}
 	if (!g_effectTypesLoaded) {
 		g_effectTypesLoaded = true;
 		g_edit->enum_effect_name(nullptr, [](void*, LPCWSTR name, int type, int flag) { g_effectTypes[name] = {type, flag}; });
 	}
+	if (g_op.active) {
+		// 右クリックを渡したのにメニューが出なかったとき・ボタンの離しを取りこぼしたときは、少ししたら戻す
+		bool l = GetAsyncKeyState(VK_LBUTTON) & 0x8000, r = GetAsyncKeyState(VK_RBUTTON) & 0x8000;
+		if (g_op.right ? (!g_op.menu && !r && GetTickCount() - g_op.time > 800) : (!l && GetTickCount() - g_op.time > 800)) op_end();
+		else { op_refresh(); return; }
+	}
 	if (g_test) run_test_commands();
-	// 右クリックを渡したのにメニューが出なかったときは、ボタンが離れて少ししたら戻す
-	if (g_fwd.pending && !g_fwd.menu && !(GetAsyncKeyState(VK_RBUTTON) & 0x8000) && GetTickCount() - g_fwd.time > 800) fwd_restore();
 
 	View v;
 	EDIT_INFO info{};
@@ -537,6 +562,7 @@ static void tick() {
 		ScreenToClient(g_host, &b);
 		v.rc = {a.x, a.y, b.x, b.y};
 		v.cursor = info.frame;
+		v.curLayer = info.layer;
 		v.rangeStart = info.select_range_start;
 		v.rangeEnd = info.select_range_end;
 		ReadCtx c{v, (int)ceil(x_to_frame(g_geo.right)) + 1};
@@ -555,7 +581,7 @@ static void tick() {
 	}
 	// 本来の位置に見えている固定レイヤーは、レイヤー名の枠を太くする
 	std::vector<RECT> frames;
-	if (geoOk && !g_fwd.pending) {  // 右クリックを本体へ渡している間は枠を出さない（本体のメニューの邪魔になる）
+	if (geoOk) {
 		for (int layer : it->second) {
 			int k = layer - info.display_layer_start;
 			int top = g_geo.rowTop + k * g_geo.rowH;
@@ -588,10 +614,46 @@ static void fill(HDC dc, RECT r, COLORREF c) {
 	DeleteObject(b);
 }
 
+// 今ある絵の上に、色 c を不透明度 alpha で重ねる
+static void fill_alpha(HDC dc, RECT r, COLORREF c, BYTE alpha) {
+	if (r.right <= r.left || r.bottom <= r.top) return;
+	BLENDFUNCTION bf{AC_SRC_OVER, 0, alpha, 0};
+	HDC tdc = CreateCompatibleDC(dc);
+	HBITMAP tb = CreateCompatibleBitmap(dc, 1, 1);
+	HGDIOBJ ob = SelectObject(tdc, tb);
+	SetPixel(tdc, 0, 0, c);
+	AlphaBlend(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, tdc, 0, 0, 1, 1, bf);
+	SelectObject(tdc, ob); DeleteObject(tb); DeleteDC(tdc);
+}
+
 static COLORREF blend(COLORREF a, COLORREF b, int alpha) {
 	return RGB((GetRValue(a) * (255 - alpha) + GetRValue(b) * alpha) / 255,
 		(GetGValue(a) * (255 - alpha) + GetGValue(b) * alpha) / 255,
 		(GetBValue(a) * (255 - alpha) + GetBValue(b) * alpha) / 255);
+}
+
+// フォーカス中のオブジェクトの枠：本体は外周 1px の点線（約 7.5px 周期、半分が線。端はぼかす）。左上から時計回り
+static void dashed_frame(HDC dc, RECT r, COLORREF c) {
+	const double period = 7.5, on = 3.75;
+	auto cover = [&](double s) {   // [s, s+1) のうち線にかかる割合
+		double k = floor(s / period) * period, sum = 0;
+		for (double a = k - period; a < s + 1; a += period) {
+			double lo = (std::max)(a, s), hi = (std::min)(a + on, s + 1);
+			if (hi > lo) sum += hi - lo;
+		}
+		return sum;
+	};
+	auto put = [&](int x, int y, double s) {
+		double cv = cover(s);
+		if (cv <= 0) return;
+		SetPixel(dc, x, y, blend(GetPixel(dc, x, y), c, (int)(cv * 255 + 0.5)));
+	};
+	int w = r.right - 1 - r.left, h = r.bottom - 1 - r.top;
+	if (w <= 0 || h <= 0) return;
+	for (int x = r.left; x < r.right; x++) put(x, r.top, x - r.left);
+	for (int y = r.top + 1; y < r.bottom; y++) put(r.right - 1, y, w + (y - r.top));
+	for (int x = r.right - 2; x >= r.left; x--) put(x, r.bottom - 1, w + h + (r.right - 1 - x));
+	for (int y = r.bottom - 2; y > r.top; y--) put(r.left, y, 2 * w + h + (r.bottom - 1 - y));
 }
 
 // 本体のオブジェクトは左から右へのグラデーション
@@ -603,15 +665,6 @@ static void hgrad(HDC dc, RECT r, COLORREF left, COLORREF right) {
 	GRADIENT_RECT gr{0, 1};
 	GradientFill(dc, v, 2, &gr, 1, GRADIENT_FILL_RECT_H);
 }
-
-// ドラッグ中の見た目
-static struct Drag {
-	bool down = false, moving = false;
-	OBJECT_HANDLE h = nullptr;
-	int start = 0, len = 0;
-	POINT p0{};
-	int dx = 0;
-} g_drag;
 
 static int obj_left(int ovLeftScreen, int start) { return (int)floor(frame_to_x(start)) - ovLeftScreen; }
 
@@ -636,11 +689,15 @@ static void paint(HWND hwnd) {
 	Col cHeader = color(L"LayerHeader", RGB(0x4a, 0x4a, 0x4a));
 	Col cText = color(L"Text", RGB(255, 255, 255));
 	Col cTextDis = color(L"TextDisable", RGB(0x90, 0x90, 0x90));
-	Col cFocus = color(L"ObjectFocus", RGB(0xc0, 0xc0, 0xc0));
+	Col cHoverObj = color(L"ObjectHover", RGB(0xff, 0xff, 0xff));
+	Col cLayerHover = color(L"LayerHover", RGB(0x58, 0x58, 0x58));
+	Col cLayerSel = color(L"LayerSelect", RGB(0x3c, 0x40, 0x54));
 	Col cCursor = color(L"FrameCursor", RGB(0xc8, 0x30, 0x30));
+	Col cCursorWide = color(L"FrameCursorWide", RGB(0xc8, 0x30, 0x30));
 	Col cRange = color(L"LayerRange", RGB(0x70, 0x70, 0x70));
 	Col cPin = color(L"BorderFocus", RGB(0x80, 0x80, 0xe0));
 	Col cBorder = color(L"Border", RGB(0x90, 0x90, 0x90));
+	Col cFocusDash = color(L"BorderSelect", RGB(0xe0, 0xe0, 0xe0));
 	const View& v = g_view;
 	static const wchar_t* kinds[][2] = {
 		{L"ObjectVideo", L"ObjectVideoSelect"}, {L"ObjectAudio", L"ObjectAudioSelect"},
@@ -665,11 +722,22 @@ static void paint(HWND hwnd) {
 			AlphaBlend(dc, clip.left, clip.top, clip.right - clip.left, clip.bottom - clip.top, tdc, 0, 0, 1, 1, bf);
 			SelectObject(tdc, ob); DeleteObject(tb); DeleteDC(tdc);
 		}
-		if (o.focus || (g_drag.moving && o.h == g_drag.h)) {
-			HBRUSH b = CreateSolidBrush(cFocus.c1);
-			FrameRect(dc, &r, b);
-			DeleteObject(b);
+		if (o.h == g_hover.obj) {
+			auto ring = [&](RECT q, BYTE a) {
+				fill_alpha(dc, {q.left, q.top, q.right, q.top + 1}, cHoverObj.c1, a);
+				fill_alpha(dc, {q.left, q.bottom - 1, q.right, q.bottom}, cHoverObj.c1, a);
+				fill_alpha(dc, {q.left, q.top + 1, q.left + 1, q.bottom - 1}, cHoverObj.c1, a);
+				fill_alpha(dc, {q.right - 1, q.top + 1, q.right, q.bottom - 1}, cHoverObj.c1, a);
+			};
+			RestoreDC(dc, saved); saved = SaveDC(dc);   // 外側の 1px はオブジェクトの外に描く
+			IntersectClipRect(dc, clip.left - 1, clip.top - 1, clip.right + 1, clip.bottom + 1);
+			RECT out = r; InflateRect(&out, 1, 1);
+			ring(out, (BYTE)(cHoverObj.a * 50 / 100));
+			ring(r, cHoverObj.a);
+			RECT in = r; InflateRect(&in, -1, -1);
+			ring(in, (BYTE)(cHoverObj.a * 50 / 100));
 		}
+		if (o.focus) dashed_frame(dc, r, cFocusDash.c1);
 		RECT tr = clip;
 		tr.left = (r.left < areaL ? areaL : r.left) + 4;
 		tr.right -= 2;
@@ -694,7 +762,7 @@ static void paint(HWND hwnd) {
 		int top = (int)i * rh, bottom = top + rh;
 		// 背景
 		RECT body{areaL, top, rc.right, bottom};
-		COLORREF bg = row.layerEnable ? cLayer.c1 : cLayerDis.c1;
+		COLORREF bg = !row.layerEnable ? cLayerDis.c1 : (g_hover.header && g_hover.row == (int)i) ? cLayerHover.c1 : row.layer == v.curLayer ? cLayerSel.c1 : cLayer.c1;
 		fill(dc, body, bg);
 		if (v.rangeStart >= 0 && v.rangeEnd >= v.rangeStart) {
 			RECT r{(int)floor(frame_to_x(v.rangeStart)) - org.x, top, (int)floor(frame_to_x(v.rangeEnd + 1)) - org.x, bottom};
@@ -703,18 +771,23 @@ static void paint(HWND hwnd) {
 		}
 		// オブジェクト（ドラッグ中のものは後で上に描く）
 		for (auto& o : row.objs) {
-			if (g_drag.moving && o.h == g_drag.h) continue;
 			RECT r{obj_left(org.x, o.start), top + objOff, obj_left(org.x, o.end + 1), bottom};
 			RECT clip;
 			if (IntersectRect(&clip, &r, &body)) draw_obj(o, r, clip, row.layerEnable, o.sel);
 			draw_sections(o, top, 0, body);
 		}
 		// 現在フレームのカーソル
-		int cx = (int)floor(frame_to_x(v.cursor)) - org.x;
-		if (cx >= areaL && cx < rc.right) fill(dc, RECT{cx, top, cx + 1, bottom}, cCursor.c1);
+		{
+			int cx0 = (int)floor(frame_to_x(v.cursor)) - org.x, cx1 = (int)floor(frame_to_x(v.cursor + 1)) - org.x;
+			bool wide = g_geo.ppf > 1.0;   // 本体は 1 フレームが 1px より広いと帯、それ以下は細い線（実測）
+			RECT cr = wide ? RECT{cx0, top, cx1, bottom} : RECT{cx0, top, cx0 + 1, bottom};
+			Col cc = wide ? cCursorWide : cCursor;
+			IntersectRect(&cr, &cr, &body);
+			fill_alpha(dc, cr, cc.c1, cc.a);
+		}
 		// レイヤー名の欄
 		if (areaL > 0) {
-			fill(dc, RECT{0, top, areaL, bottom}, cHeader.c1);
+			fill(dc, RECT{0, top, areaL, bottom}, (g_hover.header && g_hover.row == (int)i) ? cLayerHover.c1 : row.layer == v.curLayer ? cLayerSel.c1 : cHeader.c1);
 			int w = FRAME_WIDTH;
 			fill(dc, RECT{0, top, areaL, top + w}, cPin.c1);
 			fill(dc, RECT{0, bottom - w, areaL, bottom}, cPin.c1);
@@ -730,19 +803,8 @@ static void paint(HWND hwnd) {
 		// 行の境目（本体と同じく行の上端）
 		fill(dc, RECT{areaL, top, rc.right, top + 1}, cBorder.c1);
 	}
-	// ドラッグ中のオブジェクト（行の中を左右に動かす。別の行へ出たら、離した先へ移す）
-	if (g_drag.moving) {
-		for (size_t i = 0; i < v.rows.size(); i++)
-			for (auto& o : v.rows[i].objs) if (o.h == g_drag.h) {
-				int top = (int)i * rh;
-				RECT r{obj_left(org.x, o.start) + g_drag.dx, top + objOff, obj_left(org.x, o.end + 1) + g_drag.dx, top + rh};
-				RECT body{areaL, top, rc.right, top + rh}, clip;
-				if (IntersectRect(&clip, &r, &body)) draw_obj(o, r, clip, true, true);
-				draw_sections(o, top, g_drag.dx, body);
-			}
-	}
-	// 下端の線：固定の行だと分かるように
-	fill(dc, RECT{0, rc.bottom - 2, rc.right, rc.bottom}, cPin.c1);
+	// 下端の線：固定の行だと分かるように（操作の最中に上の行だけを見せているときは引かない）
+	if (!g_op.active || g_op.row < 0) fill(dc, RECT{0, rc.bottom - 2, rc.right, rc.bottom}, cPin.c1);
 
 	BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
 	SelectObject(dc, oldFont);
@@ -762,32 +824,229 @@ static int hit_row(int y) {
 	return i < (int)g_view.rows.size() ? i : -1;
 }
 
-static const Obj* hit_object(int x, int y) {
-	int i = hit_row(y);
-	if (i < 0) return nullptr;
-	POINT org{0, 0}; ClientToScreen(g_ov, &org);
-	for (auto& o : g_view.rows[i].objs)
-		if (x >= obj_left(org.x, o.start) && x < obj_left(org.x, o.end + 1)) return &o;
-	return nullptr;
-}
-
-// layer < 0 なら、離した位置のレイヤー（本来の行）へ
-struct DropCtx { OBJECT_HANDLE h; int frame; POINT screen; bool toOther; bool ok; int layer; };
-
-static void drop_cb(void* p, EDIT_SECTION* edit) {
-	DropCtx* c = (DropCtx*)p;
-	int layer = c->layer, fr = 0;
-	if (layer < 0) {
-		if (!edit->pos_to_layer_frame(c->screen.x, c->screen.y, &layer, &fr)) { c->ok = false; return; }
-	}
-	c->layer = layer;
-	c->ok = edit->move_object(c->h, layer, c->frame < 0 ? 0 : c->frame);
-	if (c->ok) edit->set_focus_object(c->h);
-}
-
 static void pins_changed() {
 	g_geoTime = 0;
 	if (g_ov) PostMessageW(g_ov, WM_TIMER, 1, 0);
+}
+
+//---------------------------------------------------------------------
+//  操作の最中（Op）：固定行の操作を本体に任せる
+//---------------------------------------------------------------------
+static HDC g_snapDC = nullptr;
+static HBITMAP g_snapBmp = nullptr;
+static HGDIOBJ g_snapOld = nullptr;
+static RECT g_snapRect{};              // 写した範囲（スクリーン座標）
+
+static int dls_now() {
+	EDIT_INFO info{};
+	g_edit->get_edit_info(&info, sizeof(info));
+	return info.display_layer_start;
+}
+
+static void free_snapshot() {
+	if (!g_snapDC) return;
+	SelectObject(g_snapDC, g_snapOld);
+	DeleteObject(g_snapBmp);
+	DeleteDC(g_snapDC);
+	g_snapDC = nullptr; g_snapBmp = nullptr; g_snapOld = nullptr;
+}
+
+// レイヤー編集の上端から下端まで（縦スクロールバーも含む）を、画面から写し取る
+static void take_snapshot() {
+	free_snapshot();
+	g_snapRect = {g_geo.left, g_geo.top, g_geo.right + g_scrollBar, g_geo.bottom};
+	int w = g_snapRect.right - g_snapRect.left, h = g_snapRect.bottom - g_snapRect.top;
+	if (w <= 0 || h <= 0) return;
+	HDC sdc = GetDC(nullptr);
+	g_snapDC = CreateCompatibleDC(sdc);
+	g_snapBmp = CreateCompatibleBitmap(sdc, w, h);
+	g_snapOld = SelectObject(g_snapDC, g_snapBmp);
+	BitBlt(g_snapDC, 0, 0, w, h, sdc, g_snapRect.left, g_snapRect.top, SRCCOPY | CAPTUREBLT);
+	ReleaseDC(nullptr, sdc);
+}
+
+static void place(HWND w, RECT screen) {
+	if (screen.right <= screen.left || screen.bottom <= screen.top) {
+		SetWindowPos(w, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+		return;
+	}
+	POINT a{screen.left, screen.top}, b{screen.right, screen.bottom};
+	ScreenToClient(g_host, &a);
+	ScreenToClient(g_host, &b);
+	SetWindowPos(w, HWND_TOP, a.x, a.y, b.x - a.x, b.y - a.y, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+	InvalidateRect(w, nullptr, FALSE);
+}
+
+// row 行目だけを本体に見せる：上の固定行は重ねた窓、下は写し。row < 0 なら全部の固定行を重ねる
+static void op_layout() {
+	update_frames({});
+	int r = g_op.row, top = g_geo.rowTop, h = g_geo.rowH;
+	if (r < 0) {
+		place(g_ov, {g_geo.left, top, g_geo.right, top + h * (int)g_op.layers.size()});
+		place(g_snap, {});
+		place(g_snapBar, {});
+		return;
+	}
+	place(g_ov, {g_geo.left, top, g_geo.right, top + h * r});
+	if (g_snapDC) {
+		// 縦スクロールでつまみが動くので、スクロールバーは上から覆う（本体に見せる行の右端も覆うが、そこはスクロールバー）
+		place(g_snap, {g_snapRect.left, top + h * (r + 1), g_snapRect.right, g_snapRect.bottom});
+		place(g_snapBar, {g_geo.right, g_snapRect.top, g_snapRect.right, top + h * (r + 1)});
+	} else {
+		place(g_snap, {});
+		place(g_snapBar, {});
+	}
+}
+
+// 本体のドラッグ中に縦スクロールできるのはマウスホイールだけ（編集セクションは使えない）。
+// 「マウスホイールで縦スクロール」が切なら Alt+ホイールで縦になる。本体は Alt を GetKeyState で見るので、
+// 本体の UI スレッドのキーの状態を一時的に書き換えて送る。どちらで縦に動くかは試して確かめる
+static int g_wheelAlt = -1;  // 1: Alt を付ける 0: 付けない -1: 未確認
+static void wheel_one(bool alt, bool down) {
+	BYTE ks[256], k2[256];
+	GetKeyboardState(ks);
+	memcpy(k2, ks, sizeof(ks));
+	k2[VK_MENU] = k2[VK_LMENU] = k2[VK_RMENU] = alt ? 0x80 : 0;
+	k2[VK_CONTROL] = k2[VK_LCONTROL] = k2[VK_RCONTROL] = 0;
+	k2[VK_SHIFT] = k2[VK_LSHIFT] = k2[VK_RSHIFT] = 0;
+	SetKeyboardState(k2);
+	POINT p; GetCursorPos(&p);
+	WPARAM btn = (GetKeyState(VK_LBUTTON) & 0x8000) ? MK_LBUTTON : 0;
+	SendMessageW(g_host, WM_MOUSEWHEEL, MAKEWPARAM(btn, (WORD)(short)(down ? -WHEEL_DELTA : WHEEL_DELTA)), MAKELPARAM(p.x, p.y));
+	SetKeyboardState(ks);
+}
+static bool wheel_to(int target) {
+	bool tried[2] = {false, false};
+	for (int guard = 0; guard < 2000; guard++) {
+		EDIT_INFO a{}; g_edit->get_edit_info(&a, sizeof(a));
+		if (a.display_layer_start == target) return true;
+		bool down = target > a.display_layer_start;
+		bool alt = g_wheelAlt != 0;
+		wheel_one(alt, down);
+		EDIT_INFO b{}; g_edit->get_edit_info(&b, sizeof(b));
+		if (b.display_layer_start != a.display_layer_start) { g_wheelAlt = alt; tried[0] = tried[1] = false; continue; }
+		// 縦に動かなかった。横に動いたなら戻して、Alt の有無を逆にして試す（どちらも動かなければ端に着いた）
+		if (b.display_frame_start != a.display_frame_start) wheel_one(alt, !down);
+		tried[alt] = true;
+		if (tried[!alt]) return false;
+		g_wheelAlt = !alt;
+	}
+	return false;
+}
+
+static bool scroll_section(int target) {
+	EDIT_INFO info{}; g_edit->get_edit_info(&info, sizeof(info));
+	if (info.display_layer_start == target) return true;
+	struct P { int a, b; } prm{target, info.display_frame_start};
+	return g_edit->call_edit_section_param(&prm, [](void* q, EDIT_SECTION* e) { auto r = (P*)q; e->set_display_layer_frame(r->a, r->b); });
+}
+
+static void op_show_row(int r, bool dragging) {
+	if (r == g_op.row) return;
+	if (g_op.row < 0) {
+		g_op.S = dls_now();   // 元の位置（本体がドラッグ中に自動スクロールしていれば、その位置）
+		take_snapshot();
+	}
+	int target = r < 0 ? g_op.S : g_op.layers[r] - r;
+	if (dragging || !scroll_section(target)) wheel_to(target);
+	g_op.row = r;
+	g_op.setTo = dls_now();
+	op_layout();
+	dbg(L"op row=%d target=%d dls=%d", r, target, dls_now());
+}
+
+static bool op_begin() {
+	if (!g_view.show || !g_geo.ok || g_edit->get_edit_state() != EDIT_HANDLE::EDIT_STATE_EDIT) return false;
+	g_op = Op{};
+	g_op.active = true;
+	g_op.S = dls_now();
+	g_op.time = GetTickCount();
+	for (auto& r : g_view.rows) g_op.layers.push_back(r.layer);
+	return true;
+}
+
+static void op_end() {
+	if (!g_op.active) return;
+	dbg(L"op end row=%d S=%d dls=%d", g_op.row, g_op.S, dls_now());
+	if (g_op.row >= 0) {
+		// 操作の間に利用者がスクロールした分（右ボタンのドラッグ・ドラッグ中の自動スクロール）は引き継ぐ
+		int back = (std::max)(0, g_op.S + dls_now() - g_op.setTo);
+		if (!scroll_section(back)) wheel_to(back);
+	}
+	g_op = Op{};
+	free_snapshot();
+	place(g_snap, {});
+	place(g_snapBar, {});
+	g_view = View{};       // 次の tick で置き直す
+	SetWindowPos(g_ov, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+	g_geoTime = 0;
+	tick();
+}
+
+// 操作の最中は並びを変えず、重ねた行の中身だけ読み直す
+static void op_refresh() {
+	if (g_op.row == 0) return;   // 重ねた行を見せていない
+	View v = g_view;
+	for (auto& r : v.rows) r.objs.clear();
+	EDIT_INFO info{}; g_edit->get_edit_info(&info, sizeof(info));
+	v.cursor = info.frame;
+	v.curLayer = info.layer;
+	v.rangeStart = info.select_range_start;
+	v.rangeEnd = info.select_range_end;
+	ReadCtx c{v, (int)ceil(x_to_frame(g_geo.right)) + 1};
+	g_edit->call_read_section_param(&c, read_objects);
+	if (c.v == g_view) return;
+	g_view = c.v;
+	InvalidateRect(g_ov, nullptr, FALSE);
+}
+
+// 本体の窓：ドラッグ中にカーソルが固定行へ入ったら、その固定レイヤーを見せる
+static LRESULT CALLBACK host_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+	switch (m) {
+	case WM_LBUTTONDOWN:
+	case WM_LBUTTONDBLCLK:
+		if (!g_op.active && g_ready && g_geo.ok) {
+			// レイヤーの行の中で押したときだけ（プレビューや時間ゲージのドラッグでは動かさない）
+			POINT p; GetCursorPos(&p);
+			if (p.x >= g_geo.left && p.x < g_geo.right + g_scrollBar && p.y >= g_geo.rowTop && p.y < g_geo.bottom && op_begin()) dbg(L"op begin (host)");
+		}
+		if (g_op.active && !g_op.right) { g_op.button = true; g_op.time = GetTickCount(); }
+		break;
+	case WM_MOUSEMOVE:
+		if (g_op.active && g_op.button && (w & MK_LBUTTON)) {
+			POINT p; GetCursorPos(&p);
+			int n = (int)g_op.layers.size(), r = -1;
+			if (p.y >= g_geo.rowTop && p.y < g_geo.rowTop + n * g_geo.rowH && p.x >= g_geo.left && p.x < g_geo.right + g_scrollBar)
+				r = (p.y - g_geo.rowTop) / g_geo.rowH;
+			op_show_row(r, true);
+		}
+		break;
+	case WM_LBUTTONUP: {
+		LRESULT ret = CallWindowProcW(g_hostProc, h, m, w, l);
+		if (g_op.active && !g_op.right) { g_op.button = false; PostMessageW(g_ov, WM_LP_END, 0, 0); }
+		return ret;
+	}
+	case WM_RBUTTONDOWN:
+	case WM_RBUTTONUP:
+	case WM_CONTEXTMENU:
+		dbg(L"host msg %04x x=%d y=%d", m, GET_X_LPARAM(l), GET_Y_LPARAM(l));
+		break;
+	}
+	return CallWindowProcW(g_hostProc, h, m, w, l);
+}
+
+static LRESULT CALLBACK snap_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+	if (msg == WM_PAINT) {
+		PAINTSTRUCT ps;
+		HDC dc = BeginPaint(hwnd, &ps);
+		RECT rc; GetClientRect(hwnd, &rc);
+		POINT o{0, 0}; ClientToScreen(hwnd, &o);
+		if (g_snapDC) BitBlt(dc, 0, 0, rc.right, rc.bottom, g_snapDC, o.x - g_snapRect.left, o.y - g_snapRect.top, SRCCOPY);
+		EndPaint(hwnd, &ps);
+		return 0;
+	}
+	if (msg == WM_ERASEBKGND) return 1;
+	return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static LRESULT CALLBACK ov_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -801,105 +1060,64 @@ static LRESULT CALLBACK ov_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	case WM_ERASEBKGND:
 		return 1;
 	case WM_SETCURSOR:
-		SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+		SetCursor(LoadCursorW(nullptr, g_hover.edge ? IDC_SIZEWE : IDC_ARROW));
 		return TRUE;
+	case WM_MOUSEMOVE: {
+		Hover hv;
+		int x = GET_X_LPARAM(lp);
+		hv.row = hit_row(GET_Y_LPARAM(lp));
+		hv.header = hv.row >= 0 && x < g_headerWidth;
+		if (hv.row >= 0 && x >= g_headerWidth) {
+			POINT org{0, 0}; ClientToScreen(hwnd, &org);
+			for (auto& o : g_view.rows[hv.row].objs) {
+				int L = obj_left(org.x, o.start), R = obj_left(org.x, o.end + 1);
+				if ((x >= L - EDGE_GRIP && x <= L + EDGE_GRIP) || (x >= R - EDGE_GRIP && x < R + EDGE_GRIP)) hv.edge = true;
+				if (x >= L && x < R) hv.obj = o.h;
+			}
+		}
+		if (!(hv == g_hover)) {
+			g_hover = hv;
+			InvalidateRect(hwnd, nullptr, FALSE);
+			SetCursor(LoadCursorW(nullptr, hv.edge ? IDC_SIZEWE : IDC_ARROW));
+		}
+		TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, hwnd, 0};
+		TrackMouseEvent(&t);
+		return 0;
+	}
+	case WM_MOUSELEAVE:
+		if (!(g_hover == Hover{})) { g_hover = Hover{}; InvalidateRect(hwnd, nullptr, FALSE); }
+		return 0;
 	case WM_MOUSEACTIVATE:
 		return MA_NOACTIVATE;
-	case WM_LBUTTONDOWN: {
-		int x = GET_X_LPARAM(lp);
-		const Obj* o = hit_object(x, GET_Y_LPARAM(lp));
-		int row = hit_row(GET_Y_LPARAM(lp));
-		dbg(L"lbuttondown x=%d row=%d hit=%d", x, row, o != nullptr);
-		if (row < 0) return 0;
-		g_drag = Drag{};
-		POINT s{x, GET_Y_LPARAM(lp)};
-		ClientToScreen(hwnd, &s);
-		if (o) {
-			Obj hit = *o;
-			// 編集セクションの後で掴む（先に掴むと、本体の処理でキャプチャが外れる）
-			g_edit->call_edit_section_param(hit.h, [](void* q, EDIT_SECTION* e) { e->set_focus_object((OBJECT_HANDLE)q); });
-			if (!g_view.rows[row].layerLock) {
-				g_drag.down = true; g_drag.h = hit.h; g_drag.start = hit.start; g_drag.len = hit.end - hit.start;
-				g_drag.p0 = s;
-				SetCapture(hwnd);
-				dbg(L"setcapture -> GetCapture=%p self=%p", (void*)GetCapture(), (void*)hwnd);
-			}
-		} else {
-			struct P { int layer, frame; } prm{g_view.rows[row].layer, (int)floor(x_to_frame(s.x))};
-			g_edit->call_edit_section_param(&prm, [](void* q, EDIT_SECTION* e) { auto r = (P*)q; e->set_cursor_layer_frame(r->layer, r->frame < 0 ? 0 : r->frame); });
-		}
-		return 0;
-	}
-	case WM_MOUSEMOVE:
-		if (g_drag.down && !(wp & MK_LBUTTON)) { g_drag = Drag{}; InvalidateRect(hwnd, nullptr, FALSE); }
-		if (g_drag.down) {
-			POINT s{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-			ClientToScreen(hwnd, &s);
-			int dx = s.x - g_drag.p0.x, dy = s.y - g_drag.p0.y;
-			if (!g_drag.moving && (abs(dx) > GetSystemMetrics(SM_CXDRAG) || abs(dy) > GetSystemMetrics(SM_CYDRAG))) g_drag.moving = true;
-			if (g_drag.moving) {
-				int df = (std::max)((int)lround(dx / g_geo.ppf), -g_drag.start);  // 0 フレームより前へは出さない
-				g_drag.dx = (int)lround(df * g_geo.ppf);
-				RECT rc; GetClientRect(hwnd, &rc);
-				POINT c{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-				SetCursor(LoadCursorW(nullptr, PtInRect(&rc, c) ? IDC_SIZEWE : IDC_SIZEALL));
-				InvalidateRect(hwnd, nullptr, FALSE);
-			}
-		}
-		return 0;
-	case WM_LBUTTONUP:
-		if (g_drag.down) {
-			ReleaseCapture();
-			if (g_drag.moving) {
-				POINT s{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-				ClientToScreen(hwnd, &s);
-				// 重ねた行の中なら、その行の固定レイヤーへ。外なら本来の行へ
-				int row = hit_row(GET_Y_LPARAM(lp));
-				int df = (std::max)((int)lround((s.x - g_drag.p0.x) / g_geo.ppf), -g_drag.start);
-				DropCtx c{g_drag.h, g_drag.start + df, s, row < 0, false, row < 0 ? -1 : g_view.rows[row].layer};
-				g_edit->call_edit_section_param(&c, drop_cb);
-				dbg(L"drop frame=%d other=%d ok=%d layer=%d", c.frame, c.toOther, c.ok, c.layer);
-				if (!c.ok) MessageBeep(MB_ICONWARNING);
-			}
-			g_drag = Drag{};
-			InvalidateRect(hwnd, nullptr, FALSE);
-			g_geoTime = 0;
-			tick();
-		}
-		return 0;
-	case WM_CAPTURECHANGED:
-		// 捕捉が外れても、ボタンが離れるまではドラッグを続ける（離れていれば次の WM_MOUSEMOVE で取り消す）
-		dbg(L"capturechanged to=%p down=%d", (void*)lp, g_drag.down);
-		return 0;
+	case WM_LBUTTONDOWN:
 	case WM_RBUTTONDOWN: {
+		// 押された固定行を本体に見せ、押す操作を本体へ渡す（後の動き・離す操作は本体に直接届く）
 		int row = hit_row(GET_Y_LPARAM(lp));
-		if (row < 0) return 0;
-		EDIT_INFO info{};
-		g_edit->get_edit_info(&info, sizeof(info));
-		if (!g_fwd.pending) g_fwd.layer = info.display_layer_start;
-		// 固定レイヤーを row 行目に出すと、それより上の固定レイヤーは重ねたまま、この行は本来の行が見える
-		struct P { int a, b; } prm{g_view.rows[row].layer - row, info.display_frame_start};
-		if (!g_edit->call_edit_section_param(&prm, [](void* q, EDIT_SECTION* e) { auto r = (P*)q; e->set_display_layer_frame(r->a, r->b); })) return 0;
-		g_fwd.pending = true; g_fwd.menu = false; g_fwd.time = GetTickCount();
-		dbg(L"rbutton forward row=%d layer=%d restore=%d", row, g_view.rows[row].layer, g_fwd.layer);
-		// 窓を動かす前に本体の座標へ直す
+		if (row < 0 || g_op.active) return 0;
 		POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-		MapWindowPoints(hwnd, g_host, &p, 1);
-		// 重ねた窓を隠し、ボタンを離す操作も本体へ届くようにする
-		// 本体はレイヤー名の欄の右クリック（WM_CONTEXTMENU）で、その位置に子ウィンドウがあると何もしない。
-		// 隠した窓も数えられるので、大きさを 0 にしておく（次の tick で置き直す）
-		SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
-		g_view = View{};
-		// レイヤー名の欄は、ボタンを離したときの WM_CONTEXTMENU でメニューが出る。
-		// 押下を渡すとメニューが出なくなる（渡さなければ、離す操作が本体に届いて出る）
-		if (GET_X_LPARAM(lp) >= g_headerWidth) {
-			PostMessageW(g_host, WM_MOUSEMOVE, wp & ~MK_RBUTTON, MAKELPARAM(p.x, p.y));
-			PostMessageW(g_host, WM_RBUTTONDOWN, wp, MAKELPARAM(p.x, p.y));
+		MapWindowPoints(hwnd, g_host, &p, 1);   // 窓を動かす前に本体の座標へ直す
+		bool header = GET_X_LPARAM(lp) < g_headerWidth;
+		if (!op_begin()) {
+			// 再生中・出力中は編集セクションを呼べない（呼ぶと再生が止まる）。本体は再生中のクリックで再生を止めるだけなので、
+			// そのまま渡す（離す操作は、本体が押下で掴むので本体に届く）
+			if (g_edit->get_edit_state() != EDIT_HANDLE::EDIT_STATE_EDIT) {
+				PostMessageW(g_host, WM_MOUSEMOVE, wp & ~(MK_LBUTTON | MK_RBUTTON), MAKELPARAM(p.x, p.y));
+				PostMessageW(g_host, msg, wp, MAKELPARAM(p.x, p.y));
+			}
+			return 0;
 		}
+		g_op.right = msg == WM_RBUTTONDOWN;
+		op_show_row(row, false);
+		dbg(L"press %04x row=%d layer=%d header=%d", msg, row, g_op.layers[row], header);
+		// レイヤー名の欄の右クリックは、離したときの WM_CONTEXTMENU でメニューが出る。押下を渡すと出なくなる。
+		// 本体はその位置に子ウィンドウがあると出さないので、押された行には窓を置かない（op_layout）
+		if (g_op.right && header) return 0;
+		PostMessageW(g_host, WM_MOUSEMOVE, wp & ~(MK_LBUTTON | MK_RBUTTON), MAKELPARAM(p.x, p.y));
+		PostMessageW(g_host, msg, wp, MAKELPARAM(p.x, p.y));
 		return 0;
 	}
-	case WM_LP_RESTORE:
-		fwd_restore();
+	case WM_LP_END:
+		op_end();
 		return 0;
 	case WM_MOUSEWHEEL:
 	case WM_MOUSEHWHEEL:
@@ -940,11 +1158,11 @@ static bool menu_has(HMENU m, const wchar_t* text) {
 
 static BOOL WINAPI hook_inner(HMENU m, UINT flags, int x, int y, int r, HWND h, const RECT* rc);
 static BOOL WINAPI hook_TrackPopupMenu(HMENU m, UINT flags, int x, int y, int r, HWND h, const RECT* rc) {
-	bool fwd = g_fwd.pending;
-	if (fwd) g_fwd.menu = true;
+	bool fwd = g_op.active && g_op.right;
+	if (fwd) g_op.menu = true;
 	BOOL ret = hook_inner(m, flags, x, y, r, h, rc);
 	// 選んだ項目の処理が済んでから縦位置を戻す
-	if (fwd && g_ov) PostMessageW(g_ov, WM_LP_RESTORE, 0, 0);
+	if (fwd && g_ov) PostMessageW(g_ov, WM_LP_END, 0, 0);
 	return ret;
 }
 
@@ -1047,7 +1265,12 @@ EXTERN_C __declspec(dllexport) void UninitializePlugin() {
 		*g_iatSlot = (ULONG_PTR)g_origTrack;
 		VirtualProtect(g_iatSlot, sizeof(void*), old, &old);
 	}
+	if (g_host && g_hostProc && GetWindowLongPtrW(g_host, GWLP_WNDPROC) == (LONG_PTR)host_proc)
+		SetWindowLongPtrW(g_host, GWLP_WNDPROC, (LONG_PTR)g_hostProc);
 	if (g_ov) { KillTimer(g_ov, 1); DestroyWindow(g_ov); g_ov = nullptr; }
+	if (g_snap) { DestroyWindow(g_snap); g_snap = nullptr; }
+	if (g_snapBar) { DestroyWindow(g_snapBar); g_snapBar = nullptr; }
+	free_snapshot();
 }
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
@@ -1073,6 +1296,7 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 
 	WNDCLASSEXW wc{sizeof(wc)};
 	wc.lpszClassName = L"LayerPinOverlay";
+	// 本体の窓クラスは CS_DBLCLKS を持たない（ダブルクリックも押下 2 回で届く）ので、こちらも持たない
 	wc.lpfnWndProc = ov_proc;
 	wc.hInstance = self;
 	wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -1084,6 +1308,11 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 	bc.hInstance = self;
 	bc.hbrBackground = CreateSolidBrush(color(L"BorderFocus", RGB(0x80, 0x80, 0xe0)).c1);
 	RegisterClassExW(&bc);
+	WNDCLASSEXW sc{sizeof(sc)};
+	sc.lpszClassName = L"LayerPinSnapshot";
+	sc.lpfnWndProc = snap_proc;
+	sc.hInstance = self;
+	RegisterClassExW(&sc);
 	g_ov = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, self, nullptr);
 	SetTimer(g_ov, 1, 33, nullptr);
 }
